@@ -1,23 +1,30 @@
 '''
 PPO implementation taken from https://github.com/openai/spinningup
 '''
-import pdb 
+
 import hydra
 from utils.ppo_buffer import PPOBuffer
 from utils import scores_to_proba_dists
-from utils.generate_prompt import generate_prompt
 import torch
 import numpy as np
 
 from tqdm import tqdm
 
-import gym
-import babyai_text
 
 from lamorel import Caller, lamorel_init
 from lamorel import BaseUpdater, BaseModuleFunction
 
+from src.sw_agent.ppo_unit_test import create_env
+
 lamorel_init()
+import pdb 
+
+def generate_prompt(obs, infos):
+    prompt = "Goal of the agent: {}\n".format(obs["mission"])
+    prompt += "History: {}\n".format(', '.join(infos['history']))
+    prompt += "Observation: {}\n".format(infos['descriptions'][0])
+    prompt += "Action: "
+    return prompt
 
 class ValueHeadModuleFn(BaseModuleFunction):
     def __init__(self, model_type):
@@ -97,9 +104,9 @@ def main(config_args):
     np.random.seed(seed)
 
     # Instantiate environment
-    name_env = config_args.rl_script_args.name_environment
-    env = gym.make(name_env)
-    actions = ["turn_left", "turn_right", "go_forward", "pick_up", "drop", "toggle"]
+    env = create_env()
+    # actions = ["turn_left", "turn_right", "go_forward", "pick_up", "drop", "toggle"]
+    actions = ["go to room", "go to hallway", "pick up chest", "pick up key", "open chest", "open key"]
 
     # Create LLM agent
     lm_server = Caller(config_args.lamorel_args,
@@ -120,13 +127,19 @@ def main(config_args):
 
     # Main loop: collect experience in env and update/log each epoch
     n_episodes = 0
+    all_rets  = []
     for epoch in range(config_args.rl_script_args.epochs):
-        final_ret = 0
         for t in range(config_args.rl_script_args.steps_per_epoch):
             prompt = generate_prompt(o, infos)
+            print(f"prompt: {prompt}")
             output = lm_server.score(contexts=[prompt], candidates=[actions],
                                      additional_module_function_keys=['value'])[0]
             proba_dist = scores_to_proba_dists(torch.reshape(output['__score'], (1, len(actions))))
+            #pdb.set_trace()
+            if t == 0:
+                print(f"proba_dist: {proba_dist.probs}")
+                # pdb.set_trace()
+
             value = output["value"][0]
             action = proba_dist.sample()
             log_prob = proba_dist.log_prob(action)
@@ -157,17 +170,17 @@ def main(config_args):
                 if timeout or epoch_ended:
                     value = lm_server.custom_module_fns(
                         module_function_keys=['value'],
-                        contexts=generate_prompt(o, infos),
+                        contexts=generate_prompt(o, infos), 
                         candidates=actions)[0]["value"][0]
                 else:
                     value = 0
                 buf.finish_path(value)
                 if terminal:
+                    all_rets.append(ep_ret)
                     n_episodes += 1
                     print(f"Episode {n_episodes}:")
                     print(f"Ret: {ep_ret}")
                     print(f"Len: {ep_len}")
-                    final_ret += ep_ret
                 (o, infos), ep_ret, ep_len = env.reset(), 0, 0
 
         # Perform PPO update!
@@ -175,8 +188,7 @@ def main(config_args):
         save_model = (epoch % config_args.rl_script_args.save_freq == 0 or
                       epoch == config_args.rl_script_args.epochs - 1) and epoch != 0
         collected_trajectories = buf.get()
-        if final_ret > 0:
-            pdb.set_trace()
+        # pdb.set_trace()
         update_results = lm_server.update(collected_trajectories['obs'],
                                             [actions for _ in range(config_args.rl_script_args.steps_per_epoch)],
                                             actions=collected_trajectories['act'],
@@ -191,6 +203,8 @@ def main(config_args):
                                             save_after_update=save_model,
                                             output_dir=config_args.rl_script_args.output_dir)
         print(f"Update results: {update_results}")
+    print(f"all rets")
+    print(all_rets)
 
 if __name__ == '__main__':
     main()

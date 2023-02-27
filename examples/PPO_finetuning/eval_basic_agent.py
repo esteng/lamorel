@@ -5,19 +5,26 @@ import pdb
 import hydra
 from utils.ppo_buffer import PPOBuffer
 from utils import scores_to_proba_dists
-from utils.generate_prompt import generate_prompt
 import torch
 import numpy as np
 
 from tqdm import tqdm
 
-import gym
-import babyai_text
 
 from lamorel import Caller, lamorel_init
 from lamorel import BaseUpdater, BaseModuleFunction
 
+from src.sw_agent.ppo_unit_test import create_env
+
 lamorel_init()
+import pdb 
+
+def generate_prompt(obs, infos):
+    prompt = "Goal of the agent: {}\n".format(obs["mission"])
+    prompt += "History: {}\n".format(', '.join(infos['history']))
+    prompt += "Observation: {}\n".format(infos['descriptions'][0])
+    prompt += "Action: "
+    return prompt
 
 class ValueHeadModuleFn(BaseModuleFunction):
     def __init__(self, model_type):
@@ -55,6 +62,7 @@ class PPOUpdater(BaseUpdater):
 
         for i in tqdm(range(kwargs["ppo_epochs"]), ascii=" " * 9 + ">", ncols=100):
             # Use LLM to compute again action probabilities and value
+            pdb.set_trace()
             output = self._llm_module(['__score', 'value'], contexts=contexts, candidates=candidates, require_grad=True)
             scores = torch.stack([_o['__score'] for _o in output]).squeeze()
             probas = scores_to_proba_dists(scores)
@@ -97,9 +105,9 @@ def main(config_args):
     np.random.seed(seed)
 
     # Instantiate environment
-    name_env = config_args.rl_script_args.name_environment
-    env = gym.make(name_env)
-    actions = ["turn_left", "turn_right", "go_forward", "pick_up", "drop", "toggle"]
+    env = create_env()
+    # actions = ["turn_left", "turn_right", "go_forward", "pick_up", "drop", "toggle"]
+    actions = ["go to room", "go to hallway", "pick up chest", "pick up key", "open chest", "open key"]
 
     # Create LLM agent
     lm_server = Caller(config_args.lamorel_args,
@@ -107,6 +115,7 @@ def main(config_args):
                        custom_module_functions={
                             'value': ValueHeadModuleFn(config_args.lamorel_args.llm_args.model_type)
                         })
+    
 
     # Set up experience buffer
     buf = PPOBuffer(config_args.rl_script_args.steps_per_epoch, config_args.rl_script_args.gamma, config_args.rl_script_args.lam)
@@ -120,77 +129,66 @@ def main(config_args):
 
     # Main loop: collect experience in env and update/log each epoch
     n_episodes = 0
-    for epoch in range(config_args.rl_script_args.epochs):
-        final_ret = 0
-        for t in range(config_args.rl_script_args.steps_per_epoch):
-            prompt = generate_prompt(o, infos)
-            output = lm_server.score(contexts=[prompt], candidates=[actions],
-                                     additional_module_function_keys=['value'])[0]
-            proba_dist = scores_to_proba_dists(torch.reshape(output['__score'], (1, len(actions))))
-            value = output["value"][0]
-            action = proba_dist.sample()
-            log_prob = proba_dist.log_prob(action)
-            a = action.cpu().item()
+    all_rets  = []
+    for t in range(config_args.rl_script_args.steps_per_epoch):
+        prompt = generate_prompt(o, infos)
+        print(f"prompt: {prompt}")
+        output = lm_server.score(contexts=[prompt], candidates=[actions],
+                                    additional_module_function_keys=['value'])[0]
+        proba_dist = scores_to_proba_dists(torch.reshape(output['__score'], (1, len(actions))))
+        #pdb.set_trace()
+        if t == 0:
+            print(f"proba_dist: {proba_dist.probs}")
+            # pdb.set_trace()
 
-            _o, r, d, infos = env.step(a)
-            next_o = {
-                "mission": _o["mission"],
-                "descriptions": infos["descriptions"]
-            }
-            ep_ret += r
-            ep_len += 1
+        value = output["value"][0]
+        # action = proba_dist.sample()
+        # take max action at test time 
+        action = torch.argmax(proba_dist.probs)
 
-            # save and log
-            buf.store(prompt, a, r, value, log_prob)
+        log_prob = proba_dist.log_prob(action)
+        a = action.cpu().item()
 
-            # Update obs (critical!)
-            o = next_o
+        _o, r, d, infos = env.step(a)
+        next_o = {
+            "mission": _o["mission"],
+            "descriptions": infos["descriptions"]
+        }
+        ep_ret += r
+        ep_len += 1
 
-            timeout = ep_len == config_args.rl_script_args.max_ep_len
-            terminal = d or timeout
-            epoch_ended = t == config_args.rl_script_args.steps_per_epoch - 1
+        # save and log
+        buf.store(prompt, a, r, value, log_prob)
 
-            if terminal or epoch_ended:
-                if epoch_ended and not (terminal):
-                    print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
-                # if trajectory didn't reach terminal state, bootstrap value target
-                if timeout or epoch_ended:
-                    value = lm_server.custom_module_fns(
-                        module_function_keys=['value'],
-                        contexts=generate_prompt(o, infos),
-                        candidates=actions)[0]["value"][0]
-                else:
-                    value = 0
-                buf.finish_path(value)
-                if terminal:
-                    n_episodes += 1
-                    print(f"Episode {n_episodes}:")
-                    print(f"Ret: {ep_ret}")
-                    print(f"Len: {ep_len}")
-                    final_ret += ep_ret
-                (o, infos), ep_ret, ep_len = env.reset(), 0, 0
+        # Update obs (critical!)
+        o = next_o
 
-        # Perform PPO update!
-        print(f"PPO update number {epoch + 1}")
-        save_model = (epoch % config_args.rl_script_args.save_freq == 0 or
-                      epoch == config_args.rl_script_args.epochs - 1) and epoch != 0
-        collected_trajectories = buf.get()
-        if final_ret > 0:
-            pdb.set_trace()
-        update_results = lm_server.update(collected_trajectories['obs'],
-                                            [actions for _ in range(config_args.rl_script_args.steps_per_epoch)],
-                                            actions=collected_trajectories['act'],
-                                            returns=collected_trajectories['ret'],
-                                            advantages=collected_trajectories['adv'],
-                                            logprobs=collected_trajectories['logp'],
-                                            lr=config_args.rl_script_args.lr,
-                                            clip_eps=config_args.rl_script_args.clip_eps,
-                                            entropy_coef=config_args.rl_script_args.entropy_coef,
-                                            value_loss_coef=config_args.rl_script_args.value_loss_coef,
-                                            ppo_epochs=config_args.rl_script_args.ppo_epochs,
-                                            save_after_update=save_model,
-                                            output_dir=config_args.rl_script_args.output_dir)
-        print(f"Update results: {update_results}")
+        timeout = ep_len == config_args.rl_script_args.max_ep_len
+        terminal = d or timeout
+        epoch_ended = t == config_args.rl_script_args.steps_per_epoch - 1
+
+        if terminal or epoch_ended:
+            if epoch_ended and not (terminal):
+                print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
+            # if trajectory didn't reach terminal state, bootstrap value target
+            if timeout or epoch_ended:
+                value = lm_server.custom_module_fns(
+                    module_function_keys=['value'],
+                    contexts=generate_prompt(o, infos), 
+                    candidates=actions)[0]["value"][0]
+            else:
+                value = 0
+            buf.finish_path(value)
+            if terminal:
+                all_rets.append(ep_ret)
+                n_episodes += 1
+                print(f"Episode {n_episodes}:")
+                print(f"Ret: {ep_ret}")
+                print(f"Len: {ep_len}")
+            (o, infos), ep_ret, ep_len = env.reset(), 0, 0
+
+    print(f"all rets")
+    print(all_rets)
 
 if __name__ == '__main__':
     main()
